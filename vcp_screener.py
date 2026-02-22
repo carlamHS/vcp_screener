@@ -1,818 +1,1606 @@
-#!/usr/bin/env python
-# coding: utf-8
+#!/usr/bin/env python3
+"""VCP Screener powered by yahooquery with local history caching.
 
-# In[5]:
+This script screens a US equity universe for Minervini-style trend template
+conditions and exports a dated report folder with:
+- candidates.csv
+- market_summary.json
+- market_history.csv (rolling history of summary metrics)
+- chart PNG files
+- optional PDF report
 
+Key design goal:
+- Avoid downloading the full universe on every run.
+- Bootstrap cache in bulk once, then refresh only stale/insufficient symbols.
+"""
 
-from pandas_datareader import data as pdr
-from yahoo_fin import stock_info as si
-from pandas import ExcelWriter
-import yfinance as yf
-import pandas as pd
-import requests
-from datetime import datetime, timedelta, date
-import time
-import matplotlib
-import matplotlib.pyplot as plt
-import numpy as np
-import mplfinance as mpf
-import xlrd
-import img2pdf
-import fnmatch
-from PIL import Image
-from PyPDF2 import PdfFileMerger, PdfFileReader
-from fpdf import FPDF 
-import os.path
-import gc
+from __future__ import annotations
+
+import argparse
 import json
-import math
-from matplotlib.backends.backend_pdf import PdfPages
-import glob
-import sys
+import random
+import time
+from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
-import subprocess
-import os
+from typing import Any, Callable, Iterable, Iterator
+from urllib.parse import quote_plus
 
-matplotlib.use('Agg')
-outputPath_name = "C:/Users/Program_data/"          # For placing your newly created pdf   .py所產生全部.pdf將會進入此folder
-pythonPath_name = "C:/Users/Program_data/python"    # For locating this .py and the list of tickers(companylist.csv)   你放置python及companylist.csv既地方
-total_info_name = "C:/Users/Program_data/total_info.csv"    # For logging the stock statistic daily  收集每日.pdf數據作縱貫分析
+import matplotlib
 
-pythonPath = Path(pythonPath_name)
-outputPath = Path(outputPath_name)
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import mplfinance as mpf
+import numpy as np
+import pandas as pd
+from matplotlib.backends.backend_pdf import PdfPages
+from yahooquery import Ticker
 
+INDEX_STYLES = {
+    "SPY": "charles",
+    "QQQ": "blueskies",
+    "DIA": "classic",
+    "IWM": "mike",
+    "VOO": "classic",
+    "FFTY": "yahoo",
+}
 
-# In[6]:
-
-
-def spawn_program_and_die(program, exit_code=0):    # 自殺再啟動用
-    """
-    Start an external program and exit the script 
-    with the specified return code.
-
-    Takes the parameter program, which is a list 
-    that corresponds to the argv of your command.
-    """
-    # Start the external program
-    subprocess.Popen(program)
-    # We have started the program, and can suspend this interpreter
-    sys.exit(exit_code)
-
-if not os.path.exists(outputPath):
-    os.makedirs(outputPath)
-
-if not os.path.exists(pythonPath):
-    os.makedirs(pythonPath)
-    
-os.chdir(outputPath)   # 轉Directory 去有pdf既位置
-listOfFiles = []
-
-Mon = 0
-Tue = 0
-Wed = 0
-Thu = 0
-Fri = 0
-
-try:
-    for name in glob.glob("????-??-??.pdf"):     # 將file名成日期, 再轉成星期一二三四五
-        filename = os.path.splitext(name)[0]
-        weekday = datetime.strptime(filename, '%Y-%m-%d').strftime('%a')
-        if weekday == "Fri":
-            Fri += 1
-        elif weekday == "Thu":
-            Thu += 1
-        elif weekday == "Wed":
-            Wed += 1
-        elif weekday == "Tue":
-            Tue += 1
-        elif weekday == "Mon":
-            Mon += 1
-except Exception as e:
-    print(e)
-print('Mon:', Mon, '  Tue:', Tue, '  Wed:', Wed,'  Thu:', Thu, '  Fri:', Fri)    
-week_day_number = -5
-if Mon == Tue == Wed == Thu == Fri:            #找出那一個weekday 最少, 由佢開始做
-    week_day_number = -5
-elif Fri == min(Mon,Tue, Wed, Thu, Fri):
-    week_day_number = -5
-elif Thu == min(Mon,Tue, Wed, Thu, Fri):
-    week_day_number = -4
-elif Wed == min(Mon,Tue, Wed, Thu, Fri):
-    week_day_number = -3
-elif Tue == min(Mon,Tue, Wed, Thu, Fri):
-    week_day_number = -2
-elif Mon == min(Mon,Tue, Wed, Thu, Fri):
-    week_day_number = -1
-    
+INDEX_SYMBOLS = tuple(INDEX_STYLES.keys())
 
 
-# In[7]:
+@dataclass
+class ScreenResult:
+    symbol: str
+    rs_rating: float
+    close: float
+    turnover: float
+    sma_20: float
+    sma_50: float
+    sma_150: float
+    sma_200: float
+    low_52w: float
+    high_52w: float
+    true_range_10d: float
 
 
-last_trade_day = datetime.utcnow() - timedelta(hours = 1)
-last_trade_day = last_trade_day.date()     #定義上一個交易日既日期, 最少要過左上一個香港日期凌晨9個鐘
-offset = (last_trade_day.weekday() + week_day_number)%7 
-last_weekday = last_trade_day - timedelta(days=offset)      #定義最少weekday 既對上一個既日期
+@dataclass
+class MarketStats:
+    total: int = 0
+    adv: int = 0
+    decl: int = 0
+    new_high: int = 0
+    new_low: int = 0
+    gauge: float = 0.0
+    above_20: int = 0
+    above_50: int = 0
+    sma20_gt_50: int = 0
+    sma50_gt_200: int = 0
+    sma50_gt_150_gt_200: int = 0
+    sma200_rising: int = 0
 
-working = True
-i = 0
+    def pct(self, value: int) -> float:
+        if self.total == 0:
+            return 0.0
+        return round(value / self.total * 100.0, 3)
 
 
-# In[11]:
+@dataclass
+class FetchMetrics:
+    requested_symbols: int = 0
+    total_batches: int = 0
+    completed_batches: int = 0
+    failed_batches: int = 0
+    retries: int = 0
+    symbols_returned: int = 0
+    recovered_symbols: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        return asdict(self)
 
 
-while working == True:
-    print("Selecting trade day...")
+@dataclass
+class CacheMetrics:
+    requested_symbols: int = 0
+    ready_symbols: int = 0
+    bootstrap_symbols: int = 0
+    incremental_symbols: int = 0
+    refreshed_symbols: int = 0
+    available_symbols: int = 0
+    failed_symbols: int = 0
+    no_data_skipped: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="VCP Screener (yahooquery edition)")
+    parser.add_argument("--symbols-csv", type=Path, default=Path("companylist.csv"))
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("reports"),
+        help="Root output folder. A date folder is created inside it.",
+    )
+    parser.add_argument(
+        "--as-of",
+        type=str,
+        default=None,
+        help="Screen date (YYYY-MM-DD). Defaults to latest weekday in UTC.",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=420,
+        help="Calendar days of price history to request.",
+    )
+    parser.add_argument("--batch-size", type=int, default=120)
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=6,
+        help="Parallel workers for batch fetches.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Retries per batch when a request fails.",
+    )
+    parser.add_argument(
+        "--retry-backoff-seconds",
+        type=float,
+        default=1.25,
+        help="Base delay for exponential backoff between retries.",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=10,
+        help="Print fetch progress every N completed batches.",
+    )
+    parser.add_argument(
+        "--fallback-singletons",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Recover failed batches by retrying each symbol individually.",
+    )
+    parser.add_argument(
+        "--fallback-max-retries",
+        type=int,
+        default=1,
+        help="Retries for per-symbol fallback recovery.",
+    )
+    parser.add_argument(
+        "--fallback-workers",
+        type=int,
+        default=4,
+        help="Parallel workers used during fallback single-symbol recovery.",
+    )
+    parser.add_argument(
+        "--cache-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable local cache-first workflow.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path(".cache") / "vcp_screener",
+        help="Directory for cached historical data.",
+    )
+    parser.add_argument(
+        "--cache-refresh-padding-days",
+        type=int,
+        default=7,
+        help="When refreshing stale symbols, re-fetch this many days before cached max date.",
+    )
+    parser.add_argument(
+        "--max-cache-rows",
+        type=int,
+        default=1200,
+        help="Maximum rows kept per symbol in cache.",
+    )
+    parser.add_argument(
+        "--cache-no-data-retry-days",
+        type=int,
+        default=7,
+        help="Days to wait before retrying symbols previously marked as no-data.",
+    )
+    parser.add_argument(
+        "--cache-stale-after-days",
+        type=int,
+        default=3,
+        help="Refresh only if cached max date is older than this many days before as-of date.",
+    )
+    parser.add_argument("--chart-limit", type=int, default=50)
+    parser.add_argument(
+        "--min-rs-rank",
+        type=float,
+        default=0.80,
+        help="Only stocks with rs_rank >= this threshold get charts.",
+    )
+    parser.add_argument(
+        "--index-charts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include index charts (SPY/QQQ/DIA/IWM/VOO/FFTY) in report.",
+    )
+    parser.add_argument(
+        "--pdf-report",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Generate a combined PDF report.",
+    )
+    return parser.parse_args()
+
+
+def default_as_of() -> date:
+    as_of = datetime.utcnow().date()
+    while as_of.weekday() >= 5:
+        as_of -= timedelta(days=1)
+    return as_of
+
+
+def parse_as_of(value: str | None) -> date:
+    if not value:
+        return default_as_of()
+    parsed = datetime.strptime(value, "%Y-%m-%d").date()
+    while parsed.weekday() >= 5:
+        parsed -= timedelta(days=1)
+    return parsed
+
+
+def chunked(values: list[str], size: int) -> Iterator[list[str]]:
+    for i in range(0, len(values), size):
+        yield values[i : i + size]
+
+
+def unique_ordered(values: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value not in seen:
+            out.append(value)
+            seen.add(value)
+    return out
+
+
+def parse_int(value: Any, default: int = 0) -> int:
     try:
-        date_study = last_weekday - i*timedelta(days = 7)   #向前找出未下載資料既weekday, 最初值 i=0
-        daily_file_name =  date_study - timedelta(days = 1)
-        i += 1
-        yf.pdr_override()
-        test = os.listdir(outputPath)
-        for item in test:
-            if item.endswith(".png"):
-                os.remove(os.path.join(outputPath, item))
-            if item.endswith(".jpg"):
-                os.remove(os.path.join(outputPath, item))
-        os.chdir(outputPath)
-        if os.path.isfile(f'{daily_file_name}.pdf'):              #萬一出現重複值, 自動continue 跳出迥圈, 回到上一個try,向前找出未下載資料既weekday             
-            continue
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def parse_iso_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "nat", "none"}:
+        return None
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def utc_now_text() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def load_symbols(csv_path: Path) -> list[str]:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Ticker list not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    symbol_col = None
+    for candidate in ("Symbol", "symbol", "Ticker", "ticker"):
+        if candidate in df.columns:
+            symbol_col = candidate
+            break
+    if symbol_col is None:
+        symbol_col = df.columns[0]
+
+    symbols = (
+        df[symbol_col]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .replace("", np.nan)
+        .dropna()
+        .tolist()
+    )
+
+    unique_symbols = unique_ordered(symbols)
+    if not unique_symbols:
+        raise ValueError(f"No symbols were found in {csv_path}")
+    return unique_symbols
+
+
+def _normalize_ohlcv(frame: pd.DataFrame) -> pd.DataFrame:
+    df = frame.copy()
+
+    if "date" in df.columns:
+        df = df.set_index("date")
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[~df.index.isna()]
+
+    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+
+    rename_map = {}
+    for col in df.columns:
+        lower = col.lower()
+        if lower in {"open", "high", "low", "close", "volume", "adjclose"}:
+            rename_map[col] = lower
+    df = df.rename(columns=rename_map)
+
+    if "adjclose" not in df.columns and "close" in df.columns:
+        df["adjclose"] = df["close"]
+
+    required = ["open", "high", "low", "close", "adjclose"]
+    if any(col not in df.columns for col in required):
+        return pd.DataFrame()
+
+    if "volume" not in df.columns:
+        df["volume"] = 0
+
+    for col in ["open", "high", "low", "close", "adjclose", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.sort_index()
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=["adjclose", "close"])
+    df["volume"] = df["volume"].fillna(0)
+
+    return df[["open", "high", "low", "close", "adjclose", "volume"]]
+
+
+def _extract_histories(raw: Any, requested_symbols: list[str]) -> dict[str, pd.DataFrame]:
+    histories: dict[str, pd.DataFrame] = {}
+
+    if isinstance(raw, pd.DataFrame):
+        frame = raw.copy()
+
+        if isinstance(frame.index, pd.MultiIndex):
+            names = [name or "" for name in frame.index.names]
+            level = names.index("symbol") if "symbol" in names else 0
+
+            for symbol in requested_symbols:
+                try:
+                    sub = frame.xs(symbol, level=level, drop_level=True)
+                except KeyError:
+                    continue
+                cleaned = _normalize_ohlcv(sub)
+                if not cleaned.empty:
+                    histories[symbol] = cleaned
+
+        elif "symbol" in frame.columns:
+            for symbol, sub in frame.groupby("symbol"):
+                normalized_symbol = str(symbol).upper()
+                if normalized_symbol not in requested_symbols:
+                    continue
+                cleaned = _normalize_ohlcv(sub.drop(columns=["symbol"]))
+                if not cleaned.empty:
+                    histories[normalized_symbol] = cleaned
+
+        elif len(requested_symbols) == 1:
+            cleaned = _normalize_ohlcv(frame)
+            if not cleaned.empty:
+                histories[requested_symbols[0]] = cleaned
+
+    elif isinstance(raw, dict):
+        for symbol in requested_symbols:
+            value = raw.get(symbol)
+            if value is None:
+                value = raw.get(symbol.lower())
+            if value is None:
+                value = raw.get(symbol.upper())
+
+            if isinstance(value, pd.DataFrame):
+                cleaned = _normalize_ohlcv(value)
+                if not cleaned.empty:
+                    histories[symbol] = cleaned
+            elif isinstance(value, list) and value:
+                cleaned = _normalize_ohlcv(pd.DataFrame(value))
+                if not cleaned.empty:
+                    histories[symbol] = cleaned
+
+    return histories
+
+
+def _fetch_batch_with_retry(
+    batch: list[str],
+    start: str,
+    end: str,
+    max_retries: int,
+    retry_backoff_seconds: float,
+) -> tuple[dict[str, pd.DataFrame], int, bool]:
+    retries_used = 0
+
+    for attempt in range(max_retries + 1):
+        try:
+            query = Ticker(batch, asynchronous=False, progress=False, validate=False)
+            raw = query.history(start=start, end=end, interval="1d")
+            histories = _extract_histories(raw, batch)
+            return histories, retries_used, True
+        except Exception:
+            if attempt >= max_retries:
+                break
+            retries_used += 1
+            delay = retry_backoff_seconds * (2**attempt)
+            delay += random.uniform(0.0, retry_backoff_seconds * 0.25)
+            time.sleep(max(0.0, delay))
+
+    return {}, retries_used, False
+
+
+def _recover_batch_as_singletons(
+    batch: list[str],
+    start: str,
+    end: str,
+    max_retries: int,
+    retry_backoff_seconds: float,
+    fallback_workers: int,
+) -> tuple[dict[str, pd.DataFrame], int]:
+    recovered: dict[str, pd.DataFrame] = {}
+    retries_used = 0
+
+    worker_count = max(1, min(fallback_workers, len(batch)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_symbol: dict[Future[tuple[dict[str, pd.DataFrame], int, bool]], str] = {}
+        for symbol in batch:
+            future = executor.submit(
+                _fetch_batch_with_retry,
+                [symbol],
+                start,
+                end,
+                max_retries,
+                retry_backoff_seconds,
+            )
+            future_to_symbol[future] = symbol
+
+        for future in as_completed(future_to_symbol):
+            try:
+                histories, symbol_retries, _ok = future.result()
+            except Exception:
+                histories, symbol_retries = {}, max_retries
+            retries_used += symbol_retries
+            recovered.update(histories)
+
+    return recovered, retries_used
+
+
+def _print_fetch_progress(label: str, metrics: FetchMetrics) -> None:
+    print(
+        f"{label}: batches {metrics.completed_batches}/{metrics.total_batches} | "
+        f"retried {metrics.retries} | failed {metrics.failed_batches} | "
+        f"recovered {metrics.recovered_symbols} | "
+        f"symbols with data {metrics.symbols_returned}/{metrics.requested_symbols}"
+    )
+
+
+def merge_fetch_metrics(target: FetchMetrics, delta: FetchMetrics) -> None:
+    target.requested_symbols += delta.requested_symbols
+    target.total_batches += delta.total_batches
+    target.completed_batches += delta.completed_batches
+    target.failed_batches += delta.failed_batches
+    target.retries += delta.retries
+    target.symbols_returned += delta.symbols_returned
+    target.recovered_symbols += delta.recovered_symbols
+
+
+def run_batch_fetch(
+    symbols: list[str],
+    start_date: date,
+    end_date: date,
+    batch_size: int,
+    max_workers: int,
+    max_retries: int,
+    retry_backoff_seconds: float,
+    progress_every: int,
+    fallback_singletons: bool,
+    fallback_max_retries: int,
+    fallback_workers: int,
+    label: str,
+    on_batch: Callable[[list[str], dict[str, pd.DataFrame]], None] | None = None,
+) -> tuple[dict[str, pd.DataFrame], FetchMetrics]:
+    symbols = unique_ordered([symbol for symbol in symbols if symbol])
+    batches = list(chunked(symbols, max(1, batch_size)))
+
+    metrics = FetchMetrics(
+        requested_symbols=len(symbols),
+        total_batches=len(batches),
+    )
+
+    start = start_date.isoformat()
+    end = (end_date + timedelta(days=1)).isoformat()
+
+    stored_histories: dict[str, pd.DataFrame] = {}
+
+    if not batches:
+        return stored_histories, metrics
+
+    def process_batch_result(
+        batch: list[str],
+        histories: dict[str, pd.DataFrame],
+        retries_used: int,
+        ok: bool,
+    ) -> None:
+        nonlocal stored_histories
+
+        if not ok:
+            metrics.failed_batches += 1
+            if fallback_singletons and batch:
+                recovered, fallback_retries = _recover_batch_as_singletons(
+                    batch=batch,
+                    start=start,
+                    end=end,
+                    max_retries=fallback_max_retries,
+                    retry_backoff_seconds=retry_backoff_seconds,
+                    fallback_workers=fallback_workers,
+                )
+                retries_used += fallback_retries
+                metrics.recovered_symbols += len(recovered)
+                histories = recovered
+
+        metrics.completed_batches += 1
+        metrics.retries += retries_used
+        metrics.symbols_returned += len(histories)
+
+        if on_batch is None:
+            stored_histories.update(histories)
         else:
-            pass                                          #如果沒有, 就繼續
-        os.chdir(pythonPath)       
-        try:
-            os.remove("stocks.csv")
-            time.sleep(1)
-        except Exception as e:
-            print(e)
-        data = pd.read_csv("companylist.csv", header=0)
-        stocklist = list(data.Symbol)
-        final = []
-        index = []
-        rs = []
-        n = -1
-        adv = 0
-        decl = 0
-        new_high = 0
-        new_low = 0
-        c_20 = 0
-        c_50 = 0
-        s_20_50 = 0
-        s_50_200 = 0
-        s_200_200_20 = 0
-        s_50_150_200 = 0
-        index_list = []
-        stocks_fit_condition = 0
-        stock_name = []
-        gauge = 0
-        exportList = pd.DataFrame(columns=['Stock', "RS_Rating", "50 Day MA", "150 Day Ma", "200 Day MA", "52 Week Low", "52 week High"])
-        for stock in stocklist:
+            on_batch(batch, histories)
+
+        if progress_every > 0 and (
+            metrics.completed_batches % progress_every == 0
+            or metrics.completed_batches == metrics.total_batches
+        ):
+            _print_fetch_progress(label, metrics)
+
+    if max_workers <= 1 or len(batches) == 1:
+        for batch in batches:
+            histories, retries_used, ok = _fetch_batch_with_retry(
+                batch=batch,
+                start=start,
+                end=end,
+                max_retries=max_retries,
+                retry_backoff_seconds=retry_backoff_seconds,
+            )
+            process_batch_result(batch, histories, retries_used, ok)
+
+        return stored_histories, metrics
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_batch: dict[Future[tuple[dict[str, pd.DataFrame], int, bool]], list[str]] = {}
+        for batch in batches:
+            future = executor.submit(
+                _fetch_batch_with_retry,
+                batch,
+                start,
+                end,
+                max_retries,
+                retry_backoff_seconds,
+            )
+            future_to_batch[future] = batch
+
+        for future in as_completed(future_to_batch):
+            batch = future_to_batch[future]
             try:
-                n += 1
-                start_date = date_study - timedelta(days=365)
-                end_date = date_study
-                print("Collecting info on {} on {}".format(stock,daily_file_name))   
-                try:
-                    df = pdr.get_data_yahoo(stock, start=start_date, end=end_date)
-                except:
-                    os.chdir(pythonPath)
-                    spawn_program_and_die(['python', 'vcp_screener.py'])
+                histories, retries_used, ok = future.result()
+            except Exception:
+                histories, retries_used, ok = {}, max_retries, False
+            process_batch_result(batch, histories, retries_used, ok)
 
-                print("Fitting info of {} for our further analysis".format(stock))           
+    return stored_histories, metrics
 
-                try:
-                    currentClose = df["Adj Close"][-1]
-                    yesterdayClose = df["Adj Close"][-2]
-                    if (currentClose > yesterdayClose):
-                        adv += 1
-                    else:
-                        decl +=1
-                except Exception as e:
-                    continue 
-                try:
-                    if (currentClose > df["Adj Close"].max()*0.97):
-                        new_high += 1
-                    elif (currentClose < df["Adj Close"].min()*1.03):
-                        new_low += 1
-                    else:
-                        pass
-                except Exception as e:
-                    print(e)
-                    continue 
-                try:
-                    close_3m = df["Adj Close"][-63]
-                except Exception as e:
-                    continue
-                try:
-                    close_6m = df["Adj Close"][-126]
-                except Exception as e:
-                    continue 
-                try:
-                    close_9m = df["Adj Close"][-189]
-                except Exception as e:
-                    continue  
-                try:
-                    close_12m = df["Adj Close"][-250]
-                except Exception as e:
-                    continue  
-                try:
-                    turnover = df["Volume"][-1]*df["Adj Close"][-1]
-                except Exception as e:
-                    continue
-                if (currentClose > yesterdayClose):
-                    gauge = gauge + turnover
-                else:
-                    gauge = gauge - turnover
-                try:
-                    true_range_10d = (max(df["Adj Close"][-10:-1])-min(df["Adj Close"][-10:-1]))
-                except Exception as e:
-                    continue  
-                try:    
-                    RS_Rating = (((currentClose - close_3m)/close_3m) * 40 + ((currentClose - close_6m)/close_6m) * 20 + ((currentClose - close_9m)/close_9m) * 20 +((currentClose - close_12m)/close_12m) * 20)  
-                except Exception as e:
-                    continue 
-                print("Fitting {} into condition...".format(stock))   
-                try:
-                    sma = [20, 50, 150, 200]
-                    for x in sma:
-                        df["SMA_"+str(x)] = round(df.iloc[:,4].rolling(window=x).mean(), 2)
-                    moving_average_20 = df["SMA_20"][-1]
-                    moving_average_50 = df["SMA_50"][-1]
-                    moving_average_150 = df["SMA_150"][-1]
-                    moving_average_200 = df["SMA_200"][-1]
-                    low_of_52week = min(df["Adj Close"][-260:])
-                    high_of_52week = max(df["Adj Close"][-260:])
-                    #print("Obtaining the moving average and the high/low of {}...".format(stock)) 
-                    try:
-                        moving_average_200_20 = df["SMA_200"][-32]
-                        #print("Obtaining the 200 moving-average 1 month before to see {} trending ...".format(stock)) 
-                    except Exception:
-                        moving_average_200_20 = 0
 
-                    # Condition 1: Current Price > 150 SMA and > 200 SMA
-                    if(currentClose > moving_average_150 > moving_average_200):
-                        condition_1 = True
-                        #print("   Condition 1 - Current Price > 150 SMA and > 200 SMA -  fullfiled")
-                    else:
-                        condition_1 = False
-                    # Condition 2: 50 SMA and > 200 SMA
-                    if(moving_average_50 > moving_average_200):
-                        condition_2 = True
-                        #print("   Condition 2 - 50 SMA and > 200 SMA - fullfiled")
-                        s_50_200 += 1
-                    else:
-                        condition_2 = False
-                    # Condition 3: 200 SMA trending up for at least 1 month (ideally 4-5 months)
-                    if(moving_average_200 > moving_average_200_20):
-                        condition_3 = True
-                        #print("   Condition 3 - 200 SMA is trending up - fullfiled")
-                        s_200_200_20 += 1
-                    else:
-                        condition_3 = False
-                    # Condition 4: 50 SMA> 150 SMA and 50 SMA> 200 SMA
-                    if(moving_average_50 > moving_average_150 > moving_average_200):
-                        #print("Condition 4 met")
-                        condition_4 = True
-                        #print("   Condition 4 - 50 SMA> 150 SMA and 50 SMA> 200 SMA - fullfiled")
-                        s_50_150_200 += 1
-                    else:
-                        #print("Condition 4 not met")
-                        condition_4 = False
-                    # Condition 5: Current Price > 50 SMA
-                    if(currentClose > moving_average_50):
-                        condition_5 = True
-                        #print("   Condition 5 - Current Price > 50 SMA - fullfiled")
-                        c_50 += 1
-                    else:
-                        condition_5 = False
-                    # Condition 6: Current Price is at least 40% above 52 week low (Many of the best are up 100-300% before coming out of consolidation)
-                    if(currentClose >= (1.4*low_of_52week)):
-                        #print("   Condition 6 - Current Price is at least 40% above 52 week low - fullfiled")
-                        condition_6 = True
-                    else:
-                        condition_6 = False
-                    # Condition 7: Current Price is within 25% of 52 week high
-                    if(currentClose >= (.75*high_of_52week)):
-                        #print("   Condition 7 - Current Price is within 25% of 52 week high - fullfiled")
-                        condition_7 = True
-                    else:
-                        condition_7 = False
-                    # Condition 8: Turnover is larger than 2 million
-                    if(turnover >= 2000000):
-                        condition_8 = True
-                        #print("   Condition 8 - Turnover is larger than 2 million - fullfiled")
-                    else:
-                        condition_8 = False
-                    # Condition 9: true range in the last 10 days is less than 8% of current price
-                    if(true_range_10d < currentClose*0.08):
-                        condition_9 = True
-                        #print("   Condition 9 - True range in the last 10 days is less than 8% of current price - fullfiled")
-                    else:
-                        condition_9 = False
-                    # Condition 10: Close above 20 days moving average
-                    if(currentClose > moving_average_20):
-                        c_20 += 1
-                    else:
-                        condition_10 = False
+def cache_prices_dir(cache_dir: Path) -> Path:
+    return cache_dir / "prices"
 
-                    # Condition 11: Current price > 10
-                    if(10 < currentClose):
-                        condition_11 = True
-                        #print("   Condition 11 - Current price is larger than $10 - fullfiled")
-                    else:
-                        condition_11 = False
-                        
-                    # Condition 12: 20 days moving average > 50 days moving average
-                    if(moving_average_20 > moving_average_50):
-                        s_20_50 += 1
-                    else:
-                        condition_12 = False
 
-                    if(condition_1 and condition_2 and condition_3 and condition_4 and condition_5 and condition_6 and condition_7 and condition_8 and condition_9 and condition_11):
-                        final.append(stock)
-                        index.append(n)
-                        rs.append(RS_Rating)
-                        stocks_fit_condition += 1                  
-                        dataframe = pd.DataFrame(list(zip(final, index, rs)), columns =['Company', 'Index', 'RS_Rating'])
-                        exportList = exportList.append({'Stock': stock, "RS_Rating": RS_Rating ,"50 Day MA": moving_average_50, "150 Day Ma": moving_average_150, "200 Day MA": moving_average_200, "52 Week Low": low_of_52week, "52 week High": high_of_52week}, ignore_index=True)
-                        print(stock + " made the requirements.------------------------------------!")
-                    else:
-                        print("-----------------"+ stock + " does not fit our requirement.")
-                except:
-                    continue 
-            except:
-                continue 
+def cache_index_path(cache_dir: Path) -> Path:
+    return cache_dir / "cache_index.csv"
 
-        try:
-            dataframe.to_csv('stocks.csv')
-            print("Transferring the tickers into stock.csv...")
-            time.sleep(4)
-        except Exception as e:
-            print(e)
-            print("No stock fit the condition!")
-        print(exportList)
 
-        if not os.path.exists('stocks.csv'):
-            dataframe = pd.DataFrame(list(zip(final, index, rs)), columns =['Company', 'Index', 'RS_Rating'])
-            dataframe.to_csv('stocks.csv')
+def cache_path_for_symbol(cache_dir: Path, symbol: str) -> Path:
+    filename = f"{quote_plus(symbol)}.pkl.gz"
+    return cache_prices_dir(cache_dir) / filename
 
-        df = pd.read_csv (open('stocks.csv'),index_col=0)
-        df['RS Rank'] = round((df.RS_Rating.rank(pct = True)*1),5)-0.01669
-        time.sleep(4)
-        df.sort_values(by=['RS Rank'], axis=0, inplace=True, ascending=False)
-        print(df)
-        try:
-            df.to_csv('stocks.csv', sep=',', encoding='utf-8')
-            df = pd.read_csv("stocks.csv", usecols=[1,4],names=['Company','RS Rank'],header = 0)
-        except:
-            df = pd.DataFrame(columns=['Company','RS Rank'])
-        time.sleep(2)
 
-        print(df)
-        stock_ind_list = []
-        for index, row in df.iterrows():
-            stock_ind = []
-            try:
-                shares = yf.Ticker(row['Company'])
-                name = row['Company']
-                RS_rank = round(1 - row['RS Rank'],5)
-                RS_rank_title = round(row['RS Rank'],5)
-                hist = shares.history(start = start_date, end = end_date)
-                filename = f"{RS_rank}_{name}"
-                titlename = f"{RS_rank_title}_{name}"
-                kwargs = dict(type='candle',mav=(20,50,200),volume=True,figratio=(51,23),figscale=0.91) 
-                print("PNG plot of {} is creating".format(name))
-                if (name == 'VOO'):
-                    mpf.plot(hist,**kwargs,style='brasil',title=titlename, savefig=dict(fname=outputPath_name+"{}.png".format(filename),dpi=125,pad_inches=0.15))
-                    index_list.append(name)
-                    stock_name.append(name)
-                    stock_ind.append(name)
-                    stock_ind.append(RS_rank_title)
-                    stock_ind_list.append(stock_ind)
-                    plt.close()    
-                elif (name == 'QQQ'):
-                    mpf.plot(hist,**kwargs,style='blueskies',title=titlename, savefig=dict(fname=outputPath_name+"{}.png".format(filename),dpi=125,pad_inches=0.15))
-                    index_list.append(name)
-                    stock_name.append(name)
-                    stock_ind.append(name)
-                    stock_ind.append(RS_rank_title)
-                    stock_ind_list.append(stock_ind)
-                    plt.close()     
-                elif (name == 'DIA'):
-                    mpf.plot(hist,**kwargs,style='mike',title=titlename, savefig=dict(fname=outputPath_name+"{}.png".format(filename),dpi=125,pad_inches=0.15))
-                    index_list.append(name)
-                    stock_name.append(name)
-                    stock_ind.append(name)
-                    stock_ind.append(RS_rank_title)
-                    stock_ind_list.append(stock_ind)
-                    plt.close()   
-                elif (name == 'IWM'):
-                    mpf.plot(hist,**kwargs,style='classic',title=titlename, savefig=dict(fname=outputPath_name+"{}.png".format(filename),dpi=125,pad_inches=0.15))
-                    index_list.append(name)
-                    stock_name.append(name)
-                    stock_ind.append(name)
-                    stock_ind.append(RS_rank_title)
-                    stock_ind_list.append(stock_ind)
-                    plt.close()
-                elif (name == 'FFTY'):
-                    mpf.plot(hist,**kwargs,style='classic',title=titlename, savefig=dict(fname=outputPath_name+"{}.png".format(filename),dpi=125,pad_inches=0.15))
-                    index_list.append(name)
-                    stock_name.append(name)
-                    stock_ind.append(name)
-                    stock_ind.append(RS_rank_title)
-                    stock_ind_list.append(stock_ind)
-                    plt.close()  
-                elif (RS_rank_title > 0.7883):
-                    mpf.plot(hist,**kwargs,style='starsandstripes',title=titlename, savefig=dict(fname=outputPath_name+"{}.png".format(filename),dpi=125,pad_inches=0.15))
-                    stock_name.append(name)
-                    stock_ind.append(name)
-                    stock_ind.append(RS_rank_title)
-                    stock_ind_list.append(stock_ind)
-                    plt.close()
-                else: 
-                    print("{} is too weak!".format(name))
-            except:
-                print("{} is not found!".format(name))
-                plt.close() 
-
-        os.chdir(outputPath)
-        inputFiles = outputPath.glob("**/*.png")
-        for f in inputFiles:
-            outputFile = outputPath / Path(f.stem + ".jpg")
-            im = Image.open(f)
-            im = im.convert('RGB')
-            im.save(outputFile)
-            print('JPG {} is created'.format(f))
-
-        def first_6chars(x):
-            return(x[:6])
-
-        jpg_list = []
-        for file in os.listdir(outputPath_name):
-            if file.endswith(".jpg"):
-                jpg_list.append(file)
-
-        try: 
-            print('Compling into the output document.')
-            with open("output_.pdf", "wb") as f:
-                f.write(img2pdf.convert([filename for filename in sorted(jpg_list, key = first_6chars)]))
-        except:
-            print("No stock fit our requirement!")
-            pdf = FPDF() 
-            pdf.add_page() 
-            pdf.output("output_.pdf")  
-        time.sleep(2.5)
-
-        f.close()
-
-        total = adv + decl
-        stock_name.sort()
-
-        print("--------------------------------------------------------------------------------")
-        a1 = (("Advance:Decline = " + str(adv) +" : " + str(decl)))
-        a2 = (("New High:New Low = " + str(new_high) +" : " + str(new_low)))
-        a3 = (("Gauge = " + str(gauge)))
-        a4 = ("Stock above its 20-DMA: " + str(round(c_20/total*100,3)))
-        a5 = ("Stock above its 50-DMA: " + str(round(c_50/total*100,3)))
-        a6 = ("Stock that its 20-DMA > 50-DMA: " + str(round(s_20_50/total*100,3)))
-        a7 = ("Stock that its 50-DMA > 200-DMA: " + str(round(s_50_200/total*100,3)))
-        a8 = ("Stock that its 50 > 150 > 200-DMA: " + str(round(s_50_150_200/total*100,3)))
-        a9 = ("Stock that its 200-DMA is rising: " + str(round(s_200_200_20/total*100,3)))
-        a10 = ("Index in strength: " + str(index_list))
-        a11 = ("Number of Stock that fit condition: " + str(stocks_fit_condition))
-
-        pdf = FPDF()
-        pdf.add_page() 
-        pdf.set_font("Times", size = 15) 
-        pdf.cell(200, 10, txt = a1,  
-                 ln = 1, align = 'L') 
-        pdf.cell(200, 10, txt = a2,  
-                 ln = 1, align = 'L')
-        pdf.cell(200, 10, txt = a3,  
-                 ln = 1, align = 'L') 
-        pdf.cell(200, 10, txt = a4,  
-                 ln = 1, align = 'L') 
-        pdf.cell(200, 10, txt = a5,  
-                 ln = 1, align = 'L') 
-        pdf.cell(200, 10, txt = a6,  
-                 ln = 1, align = 'L') 
-        pdf.cell(200, 10, txt = a7,  
-                 ln = 1, align = 'L')
-        pdf.cell(200, 10, txt = a8,  
-                 ln = 1, align = 'L')
-        pdf.cell(200, 10, txt = a9,  
-                 ln = 1, align = 'L')
-        pdf.cell(200, 10, txt = a10,  
-                 ln = 1, align = 'L')
-        pdf.cell(200, 10, txt = a11,  
-                 ln = 1, align = 'L')
-        pdf.multi_cell(200,10, str(stock_name), border = 0, 
-                        align='L', fill= False)
-
-        pdf.output("front.pdf")    
-
-        import sys
-        if not sys.warnoptions:
-            import warnings
-            warnings.simplefilter("ignore")
-
-        f_file = open("front.pdf", 'rb')
-        o_file = open("output_.pdf", 'rb')
-
-        merger = PdfFileMerger()
-        merger.append(PdfFileReader(f_file,strict=False))
-        merger.append(PdfFileReader(o_file,strict=False))
-        merger.write("output.pdf")
-
-        f_file.close()
-        o_file.close()
-
-        try:
-            os.rename("output.pdf","{}.pdf".format(daily_file_name)) 
-        except WindowsError:
-            os.remove("{}.pdf".format(daily_file_name))
-            os.rename('output.pdf',"{}.pdf".format(daily_file_name))  
-
-        print('Trade day {} is studied.'.format(daily_file_name))
-        
-        #daily_file_name = daily_file_name.strftime('%Y-%m-%d')
-        print(daily_file_name)
-        print(daily_file_name.year)
-        print(daily_file_name.month)
-        print(daily_file_name.day)
-        
-        data = {'Year':  [daily_file_name.year],
-                'Month':  [daily_file_name.month],
-                'Day':  [daily_file_name.day],
-            'Advanced stock(day)': [adv],
-            'Declined stock(day)': [decl],
-            'New High': [new_high],
-            'New Low': [new_low],
-            'Gauge': [gauge],
-            'Stock above its 20-DMA': [round(c_20/total*100,3)],
-            'Stock above its 50-DMA': [round(c_50/total*100,3)],
-            'Stock that its 20-DMA > 50-DMA': [round(s_20_50/total*100,3)],
-            'Stock that its 50-DMA > 200-DMA': [round(s_50_200/total*100,3)],
-            'Stock that its 50 > 150 > 200-DMA': [round(s_50_150_200/total*100,3)],
-            'Stock that its 200-DMA is rising': [round(s_200_200_20/total*100,3)],
-            'Number of Stock that fit condition': [stocks_fit_condition],            
-            'Number of Stock that fit condition(%)': [round(stocks_fit_condition/total*100,3)],
-            'Tickers that fit the conditions': [stock_ind_list]
-            }
-        print('Defining data...')
-        df = pd.DataFrame (data, columns = ['Year','Month','Day',
-                                            'Advanced stock(day)',
-                                            'Declined stock(day)',
-                                            'New High',
-                                            'New Low',
-                                            'Gauge',
-                                           'Stock above its 20-DMA',
-                                           'Stock above its 50-DMA',
-                                           'Stock that its 20-DMA > 50-DMA',
-                                           'Stock that its 50-DMA > 200-DMA',
-                                           'Stock that its 50 > 150 > 200-DMA',
-                                           'Stock that its 200-DMA is rising',
-                                           'Number of Stock that fit condition',
-                                           'Number of Stock that fit condition(%)',
-                                           'Tickers that fit the conditions'])
-        print(df)
-        print('Creating dataframe of the trade day {}...'.format(daily_file_name))
-        if not os.path.exists(total_info_name):
-            df.to_csv(total_info_name,index=False)
-            print('File total_info is created as it does not exist.')
-
-        if os.path.exists(total_info_name):
-            print('Collecting data from previous .csv file and convert it as dataframe...')
-            origin = pd.read_csv(total_info_name)
-            print(origin)
-            time.sleep(3) 
-            print('Appending new data to the dataframe...')
-            new = origin.append(df) 
-            print(new)
-            time.sleep(3) 
-            print('Sorting the row of the dataframe...')
-            #new['Date'] =pd.to_datetime(new.Date)
-            new = new.sort_values(by=['Year','Month','Day'])
-            print(new)
-            print('Remove duplicated row...')
-            new = new.drop_duplicates(subset=['Year','Month','Day'],keep='last')
-            time.sleep(3) 
-            print('Save the data and overwrite the total_info csv...')
-            new.to_csv(total_info_name,index=False)
-
-        working = False
-
-    except:
-        break
-
-print("Breadth will be complied in 10 sec.")
-time.sleep(10)  
-
-try:
-
-    os.chdir(outputPath)
-    df = pd.DataFrame(columns=['Date','Breadth'])
-
-    listOfFiles = os.listdir('.')
-    try:
-        listOfFiles.remove('front.pdf')
-    except Exception as e:
-        print(e)
-    try:
-        listOfFiles.remove('output_.pdf')
-    except Exception as e:
-        print(e)
-    try:
-        listOfFiles.remove('breadth.pdf')
-    except Exception as e:
-        print(e)  
-    try:
-        listOfFiles.remove('FFTY.pdf')
-    except Exception as e:
-        print(e)
-    try:
-        listOfFiles.remove('SPY.pdf')
-    except Exception as e:
-        print(e)
-    try:
-        listOfFiles.remove('DIA.pdf')
-    except Exception as e:
-        print(e)
-    try:
-        listOfFiles.remove('VOO.pdf')
-    except Exception as e:
-        print(e)
-    try:
-        listOfFiles.remove('IWM.pdf')
-    except Exception as e:
-        print(e)
-
-    pattern = "*.pdf"
-    date_list = []
-    for entry in listOfFiles:
-        if fnmatch.fnmatch(entry, pattern):
-                file_size = os.stat(entry).st_size
-                file_size_log = math.log(file_size)
-                entry = entry[:-4]
-                entry = datetime.strptime(entry, '%Y-%m-%d')
-                real_date = entry
-                date_list.append(real_date)
-                df = df.append({'Date' : real_date , 'Breadth' : file_size_log} , ignore_index=True)
-
-    df = df.set_index('Date')
+def load_cache_index(cache_dir: Path) -> dict[str, dict[str, Any]]:
+    path = cache_index_path(cache_dir)
+    if not path.exists():
+        return {}
 
     try:
-        start_date = date_list[1]
-        end_date = date_list[-1] + timedelta(days = 1)
-        stock_list = ["FFTY","SPY","DIA","VOO","IWM"]
+        df = pd.read_csv(path, dtype=str)
+    except Exception:
+        return {}
 
-        for stock in stock_list:
-            df_stock = pdr.get_data_yahoo(stock, start=start_date, end=end_date)
-            stock_hist = df_stock["Close"]
-            df = df.join(stock_hist)
-            df.rename(columns={"Close": stock},inplace = True)
+    records: dict[str, dict[str, Any]] = {}
+    for row in df.to_dict(orient="records"):
+        symbol = str(row.get("symbol", "")).strip().upper()
+        if not symbol:
+            continue
+        records[symbol] = {
+            "symbol": symbol,
+            "filename": row.get("filename", ""),
+            "min_date": row.get("min_date", ""),
+            "max_date": row.get("max_date", ""),
+            "rows": parse_int(row.get("rows", 0), 0),
+            "updated_utc": row.get("updated_utc", ""),
+            "status": row.get("status", "ok"),
+        }
 
-        df.dropna(subset = ["FFTY"], inplace=True)
-        # create figure and axis objects with subplots()
-        fig,ax1 = plt.subplots(figsize=(15,8))
-        # make a plot
-        ax1.plot(df.index, df["Breadth"], color="red")
-        # set x-axis label
-        ax1.set_xlabel("time",fontsize=14)
-        # set y-axis label
-        ax1.set_ylabel("Breadth",color="red",fontsize=14)
+    return records
 
-        # twin object for two different y-axis on the sample plot
-        ax2=ax1.twinx()
-        # make a plot with different y-axis using second axis object
-        ax2.plot(df.index, df["FFTY"],color="blue")
-        ax2.set_ylabel("FFTY",color="blue",fontsize=14)
-        plt.savefig("FFTY.pdf")
 
-        # create figure and axis objects with subplots()
-        fig,ax1 = plt.subplots(figsize=(15,8))
-        # make a plot
-        ax1.plot(df.index, df["Breadth"], color="red")
-        # set x-axis label
-        ax1.set_xlabel("time",fontsize=14)
-        # set y-axis label
-        ax1.set_ylabel("Breadth",color="red",fontsize=14)
-        # twin object for two different y-axis on the sample plot
-        ax3=ax1.twinx()
-        # make a plot with different y-axis using second axis object
-        ax3.plot(df.index, df["SPY"],color="green")
-        ax3.set_ylabel("SPY",color="green",fontsize=14)
-        plt.savefig("SPY.pdf")
+def save_cache_index(cache_dir: Path, records: dict[str, dict[str, Any]]) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    rows = sorted(records.values(), key=lambda r: str(r.get("symbol", "")))
 
-        # create figure and axis objects with subplots()
-        fig,ax1 = plt.subplots(figsize=(15,8))
-        # make a plot
-        ax1.plot(df.index, df["Breadth"], color="red")
-        # set x-axis label
-        ax1.set_xlabel("time",fontsize=14)
-        # set y-axis label
-        ax1.set_ylabel("Breadth",color="red",fontsize=14)
-        # twin object for two different y-axis on the sample plot
-        ax3=ax1.twinx()
-        # make a plot with different y-axis using second axis object
-        ax3.plot(df.index, df["DIA"],color="black")
-        ax3.set_ylabel("DIA",color="black",fontsize=14)
-        plt.savefig("DIA.pdf")
+    if rows:
+        df = pd.DataFrame(rows)
+    else:
+        df = pd.DataFrame(
+            columns=["symbol", "filename", "min_date", "max_date", "rows", "updated_utc", "status"]
+        )
 
-        # create figure and axis objects with subplots()
-        fig,ax1 = plt.subplots(figsize=(15,8))
-        # make a plot
-        ax1.plot(df.index, df["Breadth"], color="red")
-        # set x-axis label
-        ax1.set_xlabel("time",fontsize=14)
-        # set y-axis label
-        ax1.set_ylabel("Breadth",color="red",fontsize=14)
-        # twin object for two different y-axis on the sample plot
-        ax3=ax1.twinx()
-        # make a plot with different y-axis using second axis object
-        ax3.plot(df.index, df["VOO"],color="orange")
-        ax3.set_ylabel("VOO",color="orange",fontsize=14)
-        plt.savefig("VOO.pdf")
+    df.to_csv(cache_index_path(cache_dir), index=False)
 
-        # create figure and axis objects with subplots()
-        fig,ax1 = plt.subplots(figsize=(15,8))
-        # make a plot
-        ax1.plot(df.index, df["Breadth"], color="red")
-        # set x-axis label
-        ax1.set_xlabel("time",fontsize=14)
-        # set y-axis label
-        ax1.set_ylabel("Breadth",color="red",fontsize=14)
-        # twin object for two different y-axis on the sample plot
-        ax3=ax1.twinx()
-        # make a plot with different y-axis using second axis object
-        ax3.plot(df.index, df["IWM"],color="purple")
-        ax3.set_ylabel("IWM",color="purple",fontsize=14)
-        plt.savefig("IWM.pdf")
 
-        import PyPDF2 
+def load_history_from_cache(cache_dir: Path, symbol: str) -> pd.DataFrame | None:
+    path = cache_path_for_symbol(cache_dir, symbol)
+    if not path.exists():
+        return None
 
-        # Open the files that have to be merged one by one
-        pdf1File = open('FFTY.pdf', 'rb')
-        pdf2File = open('SPY.pdf', 'rb')
-        pdf3File = open('DIA.pdf', 'rb')
-        pdf4File = open('VOO.pdf', 'rb')
-        pdf5File = open('IWM.pdf', 'rb')
+    try:
+        data = pd.read_pickle(path, compression="gzip")
+    except Exception:
+        return None
 
-        # Read the files that you have opened
-        pdf1Reader = PyPDF2.PdfFileReader(pdf1File,strict=False)
-        pdf2Reader = PyPDF2.PdfFileReader(pdf2File,strict=False)
-        pdf3Reader = PyPDF2.PdfFileReader(pdf3File,strict=False)
-        pdf4Reader = PyPDF2.PdfFileReader(pdf4File,strict=False)
-        pdf5Reader = PyPDF2.PdfFileReader(pdf5File,strict=False)
+    if not isinstance(data, pd.DataFrame):
+        return None
 
-        # Create a new PdfFileWriter object which represents a blank PDF document
-        pdfWriter = PyPDF2.PdfFileWriter()
+    cleaned = _normalize_ohlcv(data)
+    if cleaned.empty:
+        return None
 
-        # Loop through all the pagenumbers for the first document
-        for pageNum in range(pdf1Reader.numPages):
-            pageObj = pdf1Reader.getPage(pageNum)
-            pdfWriter.addPage(pageObj)
+    return cleaned
 
-        # Loop through all the pagenumbers for the second document
-        for pageNum in range(pdf2Reader.numPages):
-            pageObj = pdf2Reader.getPage(pageNum)
-            pdfWriter.addPage(pageObj)
 
-        # Loop through all the pagenumbers for the third document
-        for pageNum in range(pdf3Reader.numPages):
-            pageObj = pdf3Reader.getPage(pageNum)
-            pdfWriter.addPage(pageObj)
+def store_history_in_cache(
+    cache_dir: Path,
+    symbol: str,
+    history: pd.DataFrame,
+    max_cache_rows: int,
+    index_records: dict[str, dict[str, Any]],
+) -> bool:
+    cleaned = _normalize_ohlcv(history)
+    if cleaned.empty:
+        return False
 
-        # Loop through all the pagenumbers for the fourth document
-        for pageNum in range(pdf4Reader.numPages):
-            pageObj = pdf4Reader.getPage(pageNum)
-            pdfWriter.addPage(pageObj)
+    cleaned = cleaned.sort_index()
+    if max_cache_rows > 0 and len(cleaned) > max_cache_rows:
+        cleaned = cleaned.iloc[-max_cache_rows:]
 
-        # Loop through all the pagenumbers for the fourth document
-        for pageNum in range(pdf5Reader.numPages):
-            pageObj = pdf5Reader.getPage(pageNum)
-            pdfWriter.addPage(pageObj)
+    path = cache_path_for_symbol(cache_dir, symbol)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Now that you have copied all the pages in both the documents, write them into the a new document
-        pdfOutputFile = open('breadth.pdf', 'wb')
-        pdfWriter.write(pdfOutputFile)
+    try:
+        cleaned.to_pickle(path, compression="gzip")
+    except Exception:
+        return False
 
-        # Close all the files - Created as well as opened
-        pdfOutputFile.close()
-        pdf1File.close()
-        pdf2File.close()
-        pdf3File.close()
-        pdf4File.close()
-        pdf5File.close() 
-    except IndexError as e:
-        print("IndexError: If this is your first created file, please ignore it!")
-        pass
+    index_records[symbol] = {
+        "symbol": symbol,
+        "filename": path.name,
+        "min_date": cleaned.index.min().date().isoformat(),
+        "max_date": cleaned.index.max().date().isoformat(),
+        "rows": int(len(cleaned)),
+        "updated_utc": utc_now_text(),
+        "status": "ok",
+    }
+    return True
 
-    os.chdir(pythonPath_name)
-    print("Restarting...") 
 
-except:
-    pass
-os.chdir(pythonPath)
-spawn_program_and_die(['python', 'vcp_screener.py'])
+def mark_no_data_in_cache(index_records: dict[str, dict[str, Any]], symbol: str) -> None:
+    index_records[symbol] = {
+        "symbol": symbol,
+        "filename": "",
+        "min_date": "",
+        "max_date": "",
+        "rows": 0,
+        "updated_utc": utc_now_text(),
+        "status": "no_data",
+    }
 
+
+def merge_histories(
+    existing: pd.DataFrame | None,
+    incoming: pd.DataFrame,
+    max_cache_rows: int,
+) -> pd.DataFrame:
+    pieces: list[pd.DataFrame] = []
+    if existing is not None and not existing.empty:
+        pieces.append(existing)
+    if incoming is not None and not incoming.empty:
+        pieces.append(incoming)
+
+    if not pieces:
+        return pd.DataFrame()
+
+    merged = pd.concat(pieces, axis=0)
+    merged = merged.sort_index()
+    merged = merged[~merged.index.duplicated(keep="last")]
+
+    if max_cache_rows > 0 and len(merged) > max_cache_rows:
+        merged = merged.iloc[-max_cache_rows:]
+
+    return merged
+
+
+def plan_cache_refresh(
+    symbols: list[str],
+    index_records: dict[str, dict[str, Any]],
+    cache_dir: Path,
+    required_start_date: date,
+    as_of: date,
+    min_required_rows: int,
+    refresh_padding_days: int,
+    no_data_retry_days: int,
+    stale_after_days: int,
+) -> tuple[int, list[str], dict[date, list[str]], int]:
+    ready_symbols = 0
+    bootstrap_symbols: list[str] = []
+    incremental_groups: dict[date, list[str]] = defaultdict(list)
+    no_data_skipped = 0
+    fresh_enough_threshold = as_of - timedelta(days=7)
+    stale_threshold = as_of - timedelta(days=max(0, stale_after_days))
+
+    for symbol in symbols:
+        record = index_records.get(symbol)
+        path = cache_path_for_symbol(cache_dir, symbol)
+
+        status = str(record.get("status", "")).lower() if record is not None else ""
+        if status in {"no_data", "stale_no_update"}:
+            updated = parse_iso_date(record.get("updated_utc"))
+            if updated is not None and updated >= as_of - timedelta(days=max(0, no_data_retry_days)):
+                no_data_skipped += 1
+                continue
+
+        if record is None or not path.exists():
+            bootstrap_symbols.append(symbol)
+            continue
+
+        rows = parse_int(record.get("rows", 0), 0)
+        min_date = parse_iso_date(record.get("min_date"))
+        max_date = parse_iso_date(record.get("max_date"))
+
+        if rows < min_required_rows:
+            # Common for recent IPOs: data is current but not long enough yet.
+            if max_date is not None and max_date >= fresh_enough_threshold:
+                no_data_skipped += 1
+                continue
+            bootstrap_symbols.append(symbol)
+            continue
+
+        if min_date is None or min_date > required_start_date:
+            bootstrap_symbols.append(symbol)
+            continue
+
+        if max_date is None or max_date < stale_threshold:
+            refresh_start = required_start_date
+            if max_date is not None:
+                refresh_start = max(required_start_date, max_date - timedelta(days=refresh_padding_days))
+            incremental_groups[refresh_start].append(symbol)
+            continue
+
+        ready_symbols += 1
+
+    return ready_symbols, bootstrap_symbols, incremental_groups, no_data_skipped
+
+
+def refresh_cache_for_symbols(
+    symbols: list[str],
+    cache_dir: Path,
+    required_start_date: date,
+    as_of: date,
+    min_required_rows: int,
+    max_cache_rows: int,
+    refresh_padding_days: int,
+    no_data_retry_days: int,
+    stale_after_days: int,
+    batch_size: int,
+    max_workers: int,
+    max_retries: int,
+    retry_backoff_seconds: float,
+    progress_every: int,
+    fallback_singletons: bool,
+    fallback_max_retries: int,
+    fallback_workers: int,
+) -> tuple[FetchMetrics, CacheMetrics]:
+    symbols = unique_ordered([symbol for symbol in symbols if symbol])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_prices_dir(cache_dir).mkdir(parents=True, exist_ok=True)
+
+    index_records = load_cache_index(cache_dir)
+
+    ready_symbols, bootstrap_symbols, incremental_groups, no_data_skipped = plan_cache_refresh(
+        symbols=symbols,
+        index_records=index_records,
+        cache_dir=cache_dir,
+        required_start_date=required_start_date,
+        as_of=as_of,
+        min_required_rows=min_required_rows,
+        refresh_padding_days=refresh_padding_days,
+        no_data_retry_days=no_data_retry_days,
+        stale_after_days=stale_after_days,
+    )
+
+    incremental_symbols = sum(len(v) for v in incremental_groups.values())
+
+    cache_metrics = CacheMetrics(
+        requested_symbols=len(symbols),
+        ready_symbols=ready_symbols,
+        bootstrap_symbols=len(bootstrap_symbols),
+        incremental_symbols=incremental_symbols,
+        no_data_skipped=no_data_skipped,
+    )
+
+    print(
+        f"Cache plan: ready {ready_symbols} | "
+        f"bootstrap {len(bootstrap_symbols)} | incremental {incremental_symbols}"
+    )
+
+    total_fetch_metrics = FetchMetrics()
+    refreshed_symbols: set[str] = set()
+
+    bootstrap_returned: set[str] = set()
+    if bootstrap_symbols:
+        print(f"Cache bootstrap fetch: {len(bootstrap_symbols)} symbols from {required_start_date}")
+
+        def on_bootstrap_batch(_batch: list[str], histories: dict[str, pd.DataFrame]) -> None:
+            for symbol, hist in histories.items():
+                bootstrap_returned.add(symbol)
+                stored = store_history_in_cache(
+                    cache_dir=cache_dir,
+                    symbol=symbol,
+                    history=hist,
+                    max_cache_rows=max_cache_rows,
+                    index_records=index_records,
+                )
+                if stored:
+                    refreshed_symbols.add(symbol)
+                    updated_record = index_records.get(symbol, {})
+                    rows = parse_int(updated_record.get("rows", 0), 0)
+                    max_date = parse_iso_date(updated_record.get("max_date"))
+                    if (
+                        rows < min_required_rows
+                        and max_date is not None
+                        and max_date < as_of - timedelta(days=7)
+                    ):
+                        updated_record["status"] = "stale_no_update"
+                        updated_record["updated_utc"] = utc_now_text()
+
+        _, fetch_metrics = run_batch_fetch(
+            symbols=bootstrap_symbols,
+            start_date=required_start_date,
+            end_date=as_of,
+            batch_size=batch_size,
+            max_workers=max_workers,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+            progress_every=progress_every,
+            fallback_singletons=fallback_singletons,
+            fallback_max_retries=fallback_max_retries,
+            fallback_workers=fallback_workers,
+            label="Cache bootstrap",
+            on_batch=on_bootstrap_batch,
+        )
+        merge_fetch_metrics(total_fetch_metrics, fetch_metrics)
+
+        for symbol in set(bootstrap_symbols) - bootstrap_returned:
+            mark_no_data_in_cache(index_records, symbol)
+
+    for group_start in sorted(incremental_groups.keys()):
+        group_symbols = incremental_groups[group_start]
+        if not group_symbols:
+            continue
+
+        print(f"Cache incremental fetch: {len(group_symbols)} symbols from {group_start}")
+        incremental_returned: set[str] = set()
+
+        def on_incremental_batch(_batch: list[str], histories: dict[str, pd.DataFrame]) -> None:
+            for symbol, incoming in histories.items():
+                incremental_returned.add(symbol)
+                existing_record = index_records.get(symbol, {})
+                previous_max = parse_iso_date(existing_record.get("max_date"))
+
+                existing = load_history_from_cache(cache_dir, symbol)
+                merged = merge_histories(
+                    existing=existing,
+                    incoming=incoming,
+                    max_cache_rows=max_cache_rows,
+                )
+                stored = store_history_in_cache(
+                    cache_dir=cache_dir,
+                    symbol=symbol,
+                    history=merged,
+                    max_cache_rows=max_cache_rows,
+                    index_records=index_records,
+                )
+                if stored:
+                    refreshed_symbols.add(symbol)
+                    updated_record = index_records.get(symbol, {})
+                    new_max = parse_iso_date(updated_record.get("max_date"))
+                    stale_threshold = as_of - timedelta(days=max(0, stale_after_days))
+                    if (
+                        previous_max is not None
+                        and new_max is not None
+                        and new_max <= previous_max
+                        and new_max < stale_threshold
+                    ):
+                        updated_record["status"] = "stale_no_update"
+                        updated_record["updated_utc"] = utc_now_text()
+
+        _, fetch_metrics = run_batch_fetch(
+            symbols=group_symbols,
+            start_date=group_start,
+            end_date=as_of,
+            batch_size=batch_size,
+            max_workers=max_workers,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+            progress_every=progress_every,
+            fallback_singletons=fallback_singletons,
+            fallback_max_retries=fallback_max_retries,
+            fallback_workers=fallback_workers,
+            label="Cache incremental",
+            on_batch=on_incremental_batch,
+        )
+        merge_fetch_metrics(total_fetch_metrics, fetch_metrics)
+
+        for symbol in set(group_symbols) - incremental_returned:
+            record = index_records.get(symbol)
+            if record is None:
+                continue
+            record["status"] = "stale_no_update"
+            record["updated_utc"] = utc_now_text()
+
+    save_cache_index(cache_dir, index_records)
+
+    available_symbols = 0
+    stale_threshold = as_of - timedelta(days=7)
+    for symbol in symbols:
+        record = index_records.get(symbol)
+        if record is None:
+            continue
+
+        rows = parse_int(record.get("rows", 0), 0)
+        min_date = parse_iso_date(record.get("min_date"))
+        max_date = parse_iso_date(record.get("max_date"))
+
+        if rows < min_required_rows:
+            continue
+        if min_date is None or min_date > required_start_date:
+            continue
+        if max_date is None or max_date < stale_threshold:
+            continue
+        if not cache_path_for_symbol(cache_dir, symbol).exists():
+            continue
+
+        available_symbols += 1
+
+    cache_metrics.refreshed_symbols = len(refreshed_symbols)
+    cache_metrics.available_symbols = available_symbols
+    cache_metrics.failed_symbols = max(0, len(symbols) - available_symbols)
+
+    print(
+        f"Cache status: available {cache_metrics.available_symbols}/{cache_metrics.requested_symbols} | "
+        f"refreshed {cache_metrics.refreshed_symbols} | "
+        f"no-data skipped {cache_metrics.no_data_skipped}"
+    )
+
+    return total_fetch_metrics, cache_metrics
+
+
+def stream_cached_batches(
+    symbols: list[str],
+    cache_dir: Path,
+    batch_size: int,
+    progress_every: int,
+    label: str,
+    on_batch: Callable[[list[str], dict[str, pd.DataFrame]], None],
+) -> int:
+    symbols = unique_ordered([symbol for symbol in symbols if symbol])
+    batches = list(chunked(symbols, max(1, batch_size)))
+
+    symbols_with_data = 0
+
+    if not batches:
+        return symbols_with_data
+
+    for i, batch in enumerate(batches, start=1):
+        histories: dict[str, pd.DataFrame] = {}
+        for symbol in batch:
+            hist = load_history_from_cache(cache_dir, symbol)
+            if hist is None or hist.empty:
+                continue
+            histories[symbol] = hist
+
+        symbols_with_data += len(histories)
+        on_batch(batch, histories)
+
+        if progress_every > 0 and (i % progress_every == 0 or i == len(batches)):
+            print(
+                f"{label}: batches {i}/{len(batches)} | "
+                f"symbols with data {symbols_with_data}/{len(symbols)}"
+            )
+
+    return symbols_with_data
+
+
+def load_histories_from_cache(symbols: list[str], cache_dir: Path) -> dict[str, pd.DataFrame]:
+    histories: dict[str, pd.DataFrame] = {}
+    for symbol in unique_ordered(symbols):
+        hist = load_history_from_cache(cache_dir, symbol)
+        if hist is None or hist.empty:
+            continue
+        histories[symbol] = hist
+    return histories
+
+
+def safe_ratio(current: float, base: float) -> float:
+    if base == 0:
+        return 0.0
+    return (current - base) / base
+
+
+def screen_symbol(symbol: str, hist: pd.DataFrame, stats: MarketStats) -> ScreenResult | None:
+    closes = hist["adjclose"]
+    volumes = hist["volume"]
+
+    if len(closes) < 2:
+        return None
+
+    current_close = float(closes.iloc[-1])
+    yesterday_close = float(closes.iloc[-2])
+    turnover = float(volumes.iloc[-1] * current_close)
+
+    stats.total += 1
+    if current_close > yesterday_close:
+        stats.adv += 1
+        stats.gauge += turnover
+    else:
+        stats.decl += 1
+        stats.gauge -= turnover
+
+    if current_close >= float(closes.max()) * 0.97:
+        stats.new_high += 1
+    elif current_close <= float(closes.min()) * 1.03:
+        stats.new_low += 1
+
+    sma_20_series = closes.rolling(20).mean()
+    sma_50_series = closes.rolling(50).mean()
+    sma_150_series = closes.rolling(150).mean()
+    sma_200_series = closes.rolling(200).mean()
+
+    sma_20 = float(sma_20_series.iloc[-1]) if len(closes) >= 20 else float("nan")
+    sma_50 = float(sma_50_series.iloc[-1]) if len(closes) >= 50 else float("nan")
+    sma_150 = float(sma_150_series.iloc[-1]) if len(closes) >= 150 else float("nan")
+    sma_200 = float(sma_200_series.iloc[-1]) if len(closes) >= 200 else float("nan")
+    sma_200_20 = float(sma_200_series.iloc[-21]) if len(closes) >= 220 else float("nan")
+
+    if not np.isnan(sma_20) and current_close > sma_20:
+        stats.above_20 += 1
+    if not np.isnan(sma_50) and current_close > sma_50:
+        stats.above_50 += 1
+    if not np.isnan(sma_20) and not np.isnan(sma_50) and sma_20 > sma_50:
+        stats.sma20_gt_50 += 1
+    if not np.isnan(sma_50) and not np.isnan(sma_200) and sma_50 > sma_200:
+        stats.sma50_gt_200 += 1
+    if (
+        not np.isnan(sma_50)
+        and not np.isnan(sma_150)
+        and not np.isnan(sma_200)
+        and sma_50 > sma_150 > sma_200
+    ):
+        stats.sma50_gt_150_gt_200 += 1
+    if not np.isnan(sma_200) and not np.isnan(sma_200_20) and sma_200 > sma_200_20:
+        stats.sma200_rising += 1
+
+    if len(closes) < 260:
+        return None
+
+    close_3m = float(closes.iloc[-63])
+    close_6m = float(closes.iloc[-126])
+    close_9m = float(closes.iloc[-189])
+    close_12m = float(closes.iloc[-250])
+
+    rs_rating = (
+        safe_ratio(current_close, close_3m) * 40
+        + safe_ratio(current_close, close_6m) * 20
+        + safe_ratio(current_close, close_9m) * 20
+        + safe_ratio(current_close, close_12m) * 20
+    )
+
+    low_52w = float(closes.iloc[-260:].min())
+    high_52w = float(closes.iloc[-260:].max())
+    true_range_10d = float(closes.iloc[-10:].max() - closes.iloc[-10:].min())
+
+    conditions = [
+        current_close > sma_150 > sma_200,
+        sma_50 > sma_200,
+        sma_200 > sma_200_20,
+        sma_50 > sma_150 > sma_200,
+        current_close > sma_50,
+        current_close >= 1.4 * low_52w,
+        current_close >= 0.75 * high_52w,
+        turnover >= 2_000_000,
+        true_range_10d < current_close * 0.08,
+        current_close > 10,
+    ]
+
+    if any(np.isnan(value) for value in (sma_50, sma_150, sma_200, sma_200_20)):
+        return None
+
+    if all(conditions):
+        return ScreenResult(
+            symbol=symbol,
+            rs_rating=float(rs_rating),
+            close=current_close,
+            turnover=turnover,
+            sma_20=sma_20,
+            sma_50=sma_50,
+            sma_150=sma_150,
+            sma_200=sma_200,
+            low_52w=low_52w,
+            high_52w=high_52w,
+            true_range_10d=true_range_10d,
+        )
+
+    return None
+
+
+def select_chart_symbols(candidates: pd.DataFrame, chart_limit: int, min_rs_rank: float) -> list[str]:
+    if candidates.empty or chart_limit <= 0:
+        return []
+
+    eligible = candidates[candidates["rs_rank"] >= min_rs_rank]
+    if eligible.empty:
+        return []
+
+    return eligible.head(chart_limit)["symbol"].astype(str).tolist()
+
+
+def to_plot_frame(hist: pd.DataFrame) -> pd.DataFrame:
+    return hist.rename(
+        columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    )[["Open", "High", "Low", "Close", "Volume"]]
+
+
+def create_candlestick_chart(
+    hist: pd.DataFrame,
+    title: str,
+    output_path: Path,
+    style: str = "starsandstripes",
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_frame = to_plot_frame(hist)
+
+    mpf.plot(
+        plot_frame,
+        type="candle",
+        mav=(20, 50, 200),
+        volume=True,
+        figratio=(16, 9),
+        figscale=1.1,
+        style=style,
+        title=title,
+        savefig=dict(fname=str(output_path), dpi=120, pad_inches=0.12),
+    )
+    plt.close("all")
+
+
+def generate_charts(
+    candidates: pd.DataFrame,
+    chart_symbols: list[str],
+    histories: dict[str, pd.DataFrame],
+    output_dir: Path,
+    include_indexes: bool,
+) -> list[Path]:
+    chart_paths: list[Path] = []
+    chart_dir = output_dir / "charts"
+    chart_dir.mkdir(parents=True, exist_ok=True)
+
+    if include_indexes:
+        for symbol in INDEX_SYMBOLS:
+            hist = histories.get(symbol)
+            if hist is None or len(hist) < 50:
+                continue
+            path = chart_dir / f"index_{symbol}.png"
+            create_candlestick_chart(
+                hist=hist,
+                title=f"{symbol} Index",
+                output_path=path,
+                style=INDEX_STYLES.get(symbol, "classic"),
+            )
+            chart_paths.append(path)
+
+    if not chart_symbols or candidates.empty:
+        return chart_paths
+
+    by_symbol = candidates.set_index("symbol")
+
+    for symbol in chart_symbols:
+        if symbol not in by_symbol.index:
+            continue
+
+        hist = histories.get(symbol)
+        if hist is None or len(hist) < 50:
+            continue
+
+        row = by_symbol.loc[symbol]
+        path = chart_dir / f"{row.rs_rank:.4f}_{symbol}.png"
+        create_candlestick_chart(
+            hist=hist,
+            title=f"{symbol} | RS Rank {row.rs_rank:.1%}",
+            output_path=path,
+        )
+        chart_paths.append(path)
+
+    return chart_paths
+
+
+def build_market_summary(
+    stats: MarketStats,
+    as_of: date,
+    symbols_scanned: int,
+    symbols_with_data: int,
+    candidates: int,
+    runtime_seconds: float,
+    screen_fetch_metrics: FetchMetrics,
+    chart_fetch_metrics: FetchMetrics,
+    cache_metrics: CacheMetrics | None,
+) -> dict[str, Any]:
+    summary = {
+        "as_of": as_of.isoformat(),
+        "symbols_scanned": symbols_scanned,
+        "symbols_with_data": symbols_with_data,
+        "advanced": stats.adv,
+        "declined": stats.decl,
+        "new_high": stats.new_high,
+        "new_low": stats.new_low,
+        "gauge": round(stats.gauge, 2),
+        "pct_above_20dma": stats.pct(stats.above_20),
+        "pct_above_50dma": stats.pct(stats.above_50),
+        "pct_20dma_gt_50dma": stats.pct(stats.sma20_gt_50),
+        "pct_50dma_gt_200dma": stats.pct(stats.sma50_gt_200),
+        "pct_50_gt_150_gt_200": stats.pct(stats.sma50_gt_150_gt_200),
+        "pct_200dma_rising": stats.pct(stats.sma200_rising),
+        "candidates": candidates,
+        "candidate_rate_pct": round(candidates / stats.total * 100.0, 3) if stats.total else 0.0,
+        "runtime_seconds": round(runtime_seconds, 2),
+        "screen_fetch": screen_fetch_metrics.to_dict(),
+        "chart_fetch": chart_fetch_metrics.to_dict(),
+    }
+
+    if cache_metrics is not None:
+        summary["cache"] = cache_metrics.to_dict()
+
+    return summary
+
+
+def flatten_summary_for_history(summary: dict[str, Any]) -> dict[str, Any]:
+    flat = dict(summary)
+    for key in ("screen_fetch", "chart_fetch", "cache"):
+        value = flat.pop(key, {})
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                flat[f"{key}_{sub_key}"] = sub_value
+    return flat
+
+
+def append_market_history(history_path: Path, summary: dict[str, Any]) -> None:
+    row = pd.DataFrame([flatten_summary_for_history(summary)])
+    if history_path.exists():
+        old = pd.read_csv(history_path)
+        merged = pd.concat([old, row], ignore_index=True)
+        merged = merged.drop_duplicates(subset=["as_of"], keep="last")
+        merged = merged.sort_values("as_of")
+    else:
+        merged = row
+    merged.to_csv(history_path, index=False)
+
+
+def create_pdf_report(
+    output_path: Path,
+    summary: dict[str, Any],
+    candidates: pd.DataFrame,
+    chart_paths: Iterable[Path],
+) -> None:
+    with PdfPages(output_path) as pdf:
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.patch.set_facecolor("#f7f9fb")
+        fig.text(0.05, 0.95, "VCP Screener Report", fontsize=24, fontweight="bold", va="top")
+        fig.text(0.05, 0.90, f"As of {summary['as_of']}", fontsize=13)
+
+        summary_lines = [
+            f"Symbols scanned: {summary['symbols_scanned']} (with data: {summary['symbols_with_data']})",
+            f"Advance/Decline: {summary['advanced']} / {summary['declined']}",
+            f"New High/New Low: {summary['new_high']} / {summary['new_low']}",
+            f"Gauge: {summary['gauge']:,}",
+            f"Above 20-DMA: {summary['pct_above_20dma']}%",
+            f"Above 50-DMA: {summary['pct_above_50dma']}%",
+            f"20-DMA > 50-DMA: {summary['pct_20dma_gt_50dma']}%",
+            f"50-DMA > 200-DMA: {summary['pct_50dma_gt_200dma']}%",
+            f"50 > 150 > 200-DMA: {summary['pct_50_gt_150_gt_200']}%",
+            f"Rising 200-DMA: {summary['pct_200dma_rising']}%",
+            f"Candidates: {summary['candidates']} ({summary['candidate_rate_pct']}%)",
+            f"Runtime: {summary['runtime_seconds']} sec",
+        ]
+
+        if isinstance(summary.get("cache"), dict):
+            cache = summary["cache"]
+            summary_lines.append(
+                f"Cache: {cache.get('available_symbols', 0)}/{cache.get('requested_symbols', 0)} "
+                f"available, refreshed {cache.get('refreshed_symbols', 0)}"
+            )
+
+        y = 0.84
+        for line in summary_lines:
+            fig.text(0.05, y, line, fontsize=12)
+            y -= 0.042
+
+        if not candidates.empty:
+            top = candidates[["symbol", "rs_rank", "rs_rating", "close"]].head(25).copy()
+            top["rs_rank"] = top["rs_rank"].map(lambda x: f"{x:.1%}")
+            top["rs_rating"] = top["rs_rating"].map(lambda x: f"{x:.4f}")
+            top["close"] = top["close"].map(lambda x: f"{x:.2f}")
+
+            ax = fig.add_axes([0.53, 0.13, 0.42, 0.74])
+            ax.axis("off")
+            table = ax.table(
+                cellText=top.values,
+                colLabels=["Symbol", "RS Rank", "RS Rating", "Close"],
+                loc="upper left",
+                cellLoc="left",
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1.05, 1.2)
+
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        for chart_path in chart_paths:
+            image = plt.imread(chart_path)
+            fig, ax = plt.subplots(figsize=(11, 8.5))
+            ax.imshow(image)
+            ax.axis("off")
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+
+def main() -> int:
+    args = parse_args()
+    run_started = time.perf_counter()
+
+    as_of = parse_as_of(args.as_of)
+    start_date = as_of - timedelta(days=max(300, args.lookback_days))
+
+    output_dir = args.output_root / as_of.isoformat()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    symbols = load_symbols(args.symbols_csv)
+
+    stats = MarketStats()
+    results: list[ScreenResult] = []
+    symbols_with_data = 0
+
+    def on_screen_batch(batch: list[str], histories: dict[str, pd.DataFrame]) -> None:
+        nonlocal symbols_with_data
+        for symbol in batch:
+            hist = histories.get(symbol)
+            if hist is None or hist.empty:
+                continue
+            symbols_with_data += 1
+            result = screen_symbol(symbol=symbol, hist=hist, stats=stats)
+            if result:
+                results.append(result)
+
+    screen_fetch_metrics = FetchMetrics()
+    chart_fetch_metrics = FetchMetrics()
+    cache_metrics: CacheMetrics | None = None
+
+    if args.cache_enabled:
+        cache_symbols = list(symbols)
+        if args.index_charts:
+            cache_symbols.extend(INDEX_SYMBOLS)
+        cache_symbols = unique_ordered(cache_symbols)
+
+        print(f"Preparing cache for {len(cache_symbols)} symbols ({start_date} -> {as_of})...")
+        screen_fetch_metrics, cache_metrics = refresh_cache_for_symbols(
+            symbols=cache_symbols,
+            cache_dir=args.cache_dir,
+            required_start_date=start_date,
+            as_of=as_of,
+            min_required_rows=260,
+            max_cache_rows=max(300, args.max_cache_rows),
+            refresh_padding_days=max(0, args.cache_refresh_padding_days),
+            no_data_retry_days=max(0, args.cache_no_data_retry_days),
+            stale_after_days=max(0, args.cache_stale_after_days),
+            batch_size=max(1, args.batch_size),
+            max_workers=max(1, args.max_workers),
+            max_retries=max(0, args.max_retries),
+            retry_backoff_seconds=max(0.0, args.retry_backoff_seconds),
+            progress_every=max(0, args.progress_every),
+            fallback_singletons=args.fallback_singletons,
+            fallback_max_retries=max(0, args.fallback_max_retries),
+            fallback_workers=max(1, args.fallback_workers),
+        )
+
+        print(f"Screening from cache ({len(symbols)} symbols)...")
+        symbols_with_data = stream_cached_batches(
+            symbols=symbols,
+            cache_dir=args.cache_dir,
+            batch_size=max(1, args.batch_size),
+            progress_every=max(0, args.progress_every),
+            label="Cache screen",
+            on_batch=on_screen_batch,
+        )
+
+    else:
+        print(f"Screening {len(symbols)} symbols ({start_date} -> {as_of})...")
+        _, screen_fetch_metrics = run_batch_fetch(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=as_of,
+            batch_size=max(1, args.batch_size),
+            max_workers=max(1, args.max_workers),
+            max_retries=max(0, args.max_retries),
+            retry_backoff_seconds=max(0.0, args.retry_backoff_seconds),
+            progress_every=max(0, args.progress_every),
+            fallback_singletons=args.fallback_singletons,
+            fallback_max_retries=max(0, args.fallback_max_retries),
+            fallback_workers=max(1, args.fallback_workers),
+            label="Screen fetch",
+            on_batch=on_screen_batch,
+        )
+
+    if results:
+        candidates = pd.DataFrame(asdict(row) for row in results)
+        candidates["rs_rank"] = candidates["rs_rating"].rank(pct=True, method="min")
+        candidates = candidates.sort_values(["rs_rank", "rs_rating"], ascending=[False, False])
+    else:
+        candidates = pd.DataFrame(
+            columns=[
+                "symbol",
+                "rs_rating",
+                "close",
+                "turnover",
+                "sma_20",
+                "sma_50",
+                "sma_150",
+                "sma_200",
+                "low_52w",
+                "high_52w",
+                "true_range_10d",
+                "rs_rank",
+            ]
+        )
+
+    candidates_path = output_dir / "candidates.csv"
+    candidates.to_csv(candidates_path, index=False)
+
+    chart_symbols = select_chart_symbols(
+        candidates=candidates,
+        chart_limit=max(0, args.chart_limit),
+        min_rs_rank=max(0.0, min(1.0, args.min_rs_rank)),
+    )
+
+    chart_fetch_symbols: list[str] = list(chart_symbols)
+    if args.index_charts:
+        chart_fetch_symbols.extend(INDEX_SYMBOLS)
+    chart_fetch_symbols = unique_ordered(chart_fetch_symbols)
+
+    chart_histories: dict[str, pd.DataFrame] = {}
+
+    if chart_fetch_symbols:
+        if args.cache_enabled:
+            chart_histories = load_histories_from_cache(chart_fetch_symbols, args.cache_dir)
+            chart_fetch_metrics = FetchMetrics(
+                requested_symbols=len(chart_fetch_symbols),
+                total_batches=0,
+                completed_batches=0,
+                failed_batches=0,
+                retries=0,
+                symbols_returned=len(chart_histories),
+                recovered_symbols=0,
+            )
+            print(
+                f"Cache chart load: symbols with data {len(chart_histories)}/{len(chart_fetch_symbols)}"
+            )
+        else:
+            print(f"Fetching chart histories for {len(chart_fetch_symbols)} symbols...")
+            chart_histories, chart_fetch_metrics = run_batch_fetch(
+                symbols=chart_fetch_symbols,
+                start_date=start_date,
+                end_date=as_of,
+                batch_size=min(max(1, args.batch_size), 60),
+                max_workers=max(1, min(args.max_workers, 4)),
+                max_retries=max(0, args.max_retries),
+                retry_backoff_seconds=max(0.0, args.retry_backoff_seconds),
+                progress_every=max(0, args.progress_every),
+                fallback_singletons=args.fallback_singletons,
+                fallback_max_retries=max(0, args.fallback_max_retries),
+                fallback_workers=max(1, args.fallback_workers),
+                label="Chart fetch",
+                on_batch=None,
+            )
+
+    chart_paths = generate_charts(
+        candidates=candidates,
+        chart_symbols=chart_symbols,
+        histories=chart_histories,
+        output_dir=output_dir,
+        include_indexes=args.index_charts,
+    )
+
+    runtime_seconds = time.perf_counter() - run_started
+
+    summary = build_market_summary(
+        stats=stats,
+        as_of=as_of,
+        symbols_scanned=len(symbols),
+        symbols_with_data=symbols_with_data,
+        candidates=len(candidates),
+        runtime_seconds=runtime_seconds,
+        screen_fetch_metrics=screen_fetch_metrics,
+        chart_fetch_metrics=chart_fetch_metrics,
+        cache_metrics=cache_metrics,
+    )
+
+    summary_path = output_dir / "market_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    history_path = args.output_root / "market_history.csv"
+    append_market_history(history_path, summary)
+
+    if args.pdf_report:
+        pdf_path = output_dir / "report.pdf"
+        create_pdf_report(
+            output_path=pdf_path,
+            summary=summary,
+            candidates=candidates,
+            chart_paths=chart_paths,
+        )
+
+    print("Run complete")
+    print(f"- Candidates: {len(candidates)}")
+    print(f"- Summary:    {summary_path}")
+    print(f"- CSV:        {candidates_path}")
+    print(f"- Charts:     {len(chart_paths)}")
+    print(f"- Runtime:    {runtime_seconds:.2f} sec")
+    if args.pdf_report:
+        print(f"- PDF:        {output_dir / 'report.pdf'}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

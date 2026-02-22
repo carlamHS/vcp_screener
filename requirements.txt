@@ -1,0 +1,5 @@
+matplotlib>=3.8
+mplfinance>=0.12.10b0
+numpy>=1.26
+pandas>=2.1
+yahooquery>=2.3.7
